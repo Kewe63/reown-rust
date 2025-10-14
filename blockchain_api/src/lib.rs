@@ -26,6 +26,7 @@ pub struct BlockchainApiProvider {
     blockchain_api_rpc_endpoint: Url,
     supported_chains: Arc<RwLock<HashSet<String>>>,
     refresh_job: Arc<JoinHandle<Infallible>>,
+    client: Arc<reqwest::Client>,
 }
 
 impl Drop for BlockchainApiProvider {
@@ -35,13 +36,17 @@ impl Drop for BlockchainApiProvider {
 }
 
 async fn refresh_supported_chains(
+    client: &reqwest::Client,
     blockchain_api_supported_chains_endpoint: Url,
     supported_chains: &RwLock<HashSet<String>>,
 ) -> Result<(), Error> {
-    let response = reqwest::get(blockchain_api_supported_chains_endpoint)
+    let response = client
+        .get(blockchain_api_supported_chains_endpoint.clone())
+        .send()
         .await?
         .json::<SupportedChainsResponse>()
         .await?;
+
     *supported_chains.write().await = response.http;
     Ok(())
 }
@@ -55,37 +60,51 @@ impl BlockchainApiProvider {
             .join(BLOCKCHAIN_API_SUPPORTED_CHAINS_ENDPOINT_STR)
             .expect("Safe unwrap: hardcoded URL: BLOCKCHAIN_API_SUPPORTED_CHAINS_ENDPOINT_STR");
 
+        let client = Arc::new(reqwest::Client::new());
         let supported_chains = Arc::new(RwLock::new(HashSet::new()));
+
+        // İlk fetch
         refresh_supported_chains(
+            &client,
             blockchain_api_supported_chains_endpoint.clone(),
             &supported_chains,
         )
         .await?;
+
         let mut interval = tokio::time::interval(SUPPORTED_CHAINS_REFRESH_INTERVAL);
         interval.tick().await;
+
         let refresh_job = tokio::task::spawn({
             let supported_chains = supported_chains.clone();
             let blockchain_api_supported_chains_endpoint =
                 blockchain_api_supported_chains_endpoint.clone();
+            let client = client.clone();
+
             async move {
                 loop {
                     interval.tick().await;
                     if let Err(e) = refresh_supported_chains(
+                        &client,
                         blockchain_api_supported_chains_endpoint.clone(),
                         &supported_chains,
                     )
                     .await
                     {
-                        error!("Failed to refresh supported chains: {e}");
+                        error!(
+                            "Failed to refresh supported chains from {}: {e}",
+                            blockchain_api_supported_chains_endpoint
+                        );
                     }
                 }
             }
         });
+
         Ok(Self {
             project_id,
             blockchain_api_rpc_endpoint,
             supported_chains,
             refresh_job: Arc::new(refresh_job),
+            client,
         })
     }
 }
@@ -129,5 +148,18 @@ mod tests {
             .as_str(),
             "https://rpc.walletconnect.com/v1?chainId=eip155%3A1&projectId=my-project-id"
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_chain_returns_none() {
+        let provider = BlockchainApiProvider {
+            project_id: ProjectId::from("my-project-id"),
+            blockchain_api_rpc_endpoint: Url::parse("https://rpc.walletconnect.com/v1").unwrap(),
+            supported_chains: Arc::new(RwLock::new(HashSet::new())),
+            refresh_job: Arc::new(tokio::spawn(async { std::future::pending::<Infallible>().await })),
+            client: Arc::new(reqwest::Client::new()),
+        };
+
+        assert!(provider.get_rpc_url("unknown-chain".to_string()).await.is_none());
     }
 }
